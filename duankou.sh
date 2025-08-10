@@ -10,8 +10,12 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 SCRIPT_NAME="Smart Firewall Configuration Script"
+# 更新日志 v3.1:
+# - [BUGFIX] 修复了 get_listening_ports 函数中 awk 脚本的正则表达式语法错误 (unmatched parenthesis)。
+# - [IMPROVE] 加固了进程名提取逻辑的健壮性。
+#
 # 更新日志 v3.0:
 # - 重构端口判断逻辑: 基于监听地址(公网/内网)而非端口号, 解决高位端口被忽略问题。
 # - 全面支持UDP: 同时检测并处理TCP和UDP端口。
@@ -80,6 +84,7 @@ TRUSTED_PROCESSES=(
     "xray" "v2ray" "sing-box" "trojan-go" "hysteria"
     "ss-server" "ss-manager" "sslocal" "obfs-server"
     "HiddifyCli" # 根据你的ss输出添加
+    "python" # 根据你的ss输出添加, 如果是公开服务
 )
 
 # ==============================================================================
@@ -176,9 +181,9 @@ create_backup() {
     mkdir -p "$BACKUP_DIR"
     {
         echo "# UFW Status Backup"
-        ufw status numbered
+        ufw status numbered 2>/dev/null || echo "UFW not enabled."
         echo -e "\n# IPTables Rules Backup"
-        iptables-save
+        iptables-save 2>/dev/null || echo "iptables-save failed."
         echo -e "\n# Listening Ports Backup"
         ss -tulnp
     } > "$BACKUP_DIR/firewall_state.bak"
@@ -218,14 +223,13 @@ get_listening_ports() {
         protocol = $1
         listen_addr_port = $5
 
-        # 获取进程名, 兼容不同ss版本输出
+        # 提取进程名，已修复正则表达式错误
         process = "unknown"
         if (match($0, /users:\(\("([^"]+)"/, p)) {
             process = p[1]
-        } else if (match($0, /("([^"]+)",pid=/, p)) {
-            process = p[2]
+        } else if (match($0, /\("([^"]+)",pid=/ , p)) { # <-- 此处是关键修正点
+            process = p[1]
         }
-
 
         # 分离地址和端口, 兼容IPv4和IPv6
         if (match(listen_addr_port, /^(.*):([0-9]+)$/, parts)) {
