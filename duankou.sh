@@ -6,43 +6,54 @@ YELLOW="\033[33m"
 RED="\033[31m"
 RESET="\033[0m"
 
-echo -e "${YELLOW}== 🔥 智能防火墙配置脚本（代理节点 + 网站专用版） ==${RESET}"
+echo -e "${YELLOW}== 🔥 一键智能安全防护脚本（代理 + 网站 + 防爆破） ==${RESET}"
 
 # 检查 root
 [ "$(id -u)" != "0" ] && echo -e "${RED}请用 root 运行${RESET}" && exit 1
 
-# 高危端口（不开放）
-BAD_PORTS="135 137 138 139 445 1433 1521 3306 3389 5900 5901 5985 5986 6379 11211 27017 27018"
+############################################
+# 0⃣ 彻底卸载清空防火墙规则
+############################################
+echo -e "${YELLOW}0⃣ 清空并卸载旧防火墙规则...${RESET}"
+systemctl stop ufw 2>/dev/null || true
+systemctl disable ufw 2>/dev/null || true
+ufw --force reset 2>/dev/null || true
 
-# 允许的数据库端口及来源 IP（如有需要可改）
-DB_PORTS="3306 5432 6379"
-DB_ALLOWED_IP="127.0.0.1"
+# 清空 iptables / ip6tables
+iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X && iptables -t mangle -F && iptables -t mangle -X
+ip6tables -F && ip6tables -X && ip6tables -t nat -F && ip6tables -t nat -X && ip6tables -t mangle -F && ip6tables -t mangle -X
 
-# 默认开放端口
-DEFAULT_TCP="22 80 443"
-DEFAULT_UDP="80 443"
-
-# 清空规则
-echo -e "${YELLOW}1⃣ 清空所有防火墙规则...${RESET}"
-ufw --force reset
-iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X
-ip6tables -F && ip6tables -X && ip6tables -t nat -F && ip6tables -t nat -X
+# 清空 nftables
 nft flush ruleset || true
 
-# 安装 UFW
-echo -e "${YELLOW}2⃣ 安装并配置 UFW...${RESET}"
+############################################
+# 1⃣ 安装 UFW
+############################################
+echo -e "${YELLOW}1⃣ 安装并配置 UFW...${RESET}"
 apt update -y && apt install -y ufw
+
 sed -i 's/IPV6=no/IPV6=yes/' /etc/default/ufw || true
 ufw default deny incoming
 ufw default allow outgoing
 
-# 开放默认端口
-echo -e "${YELLOW}3⃣ 开放默认端口...${RESET}"
+############################################
+# 2⃣ 端口设置
+############################################
+BAD_PORTS="135 137 138 139 445 1433 1521 3389 5900 5901 5985 5986 11211 27017 27018"
+DB_PORTS="3306 5432 6379"
+DB_ALLOWED_IP="127.0.0.1"
+
+DEFAULT_TCP="22 80 443"
+DEFAULT_UDP="80 443"
+
+echo -e "${YELLOW}2⃣ 开放默认端口...${RESET}"
 for p in $DEFAULT_TCP; do ufw allow ${p}/tcp; done
 for p in $DEFAULT_UDP; do ufw allow ${p}/udp; done
 
-# 自动识别监听端口（系统）
-echo -e "${YELLOW}4⃣ 识别当前监听端口并开放...${RESET}"
+############################################
+# 3⃣ 自动识别系统监听端口
+############################################
+echo -e "${YELLOW}3⃣ 自动识别系统监听端口...${RESET}"
 LISTEN_PORTS=$(ss -lnpH -4 -6 | awk '{print $1, $5}' | sed 's/.*://g' | awk '{print $1, $2}' | sort -u)
 
 while read -r proto port; do
@@ -50,7 +61,6 @@ while read -r proto port; do
     [[ "$port" -le 0 || "$port" -gt 65535 ]] && continue
     [[ "$BAD_PORTS" =~ (^|[[:space:]])"$port"($|[[:space:]]) ]] && continue
     [[ "$port" -gt 49151 ]] && continue
-    # 数据库端口特殊处理
     if [[ "$DB_PORTS" =~ (^|[[:space:]])"$port"($|[[:space:]]) ]]; then
         ufw allow from "$DB_ALLOWED_IP" to any port "$port" proto "$proto"
     else
@@ -58,37 +68,86 @@ while read -r proto port; do
     fi
 done <<< "$LISTEN_PORTS"
 
-# 检测 Docker 容器端口
+############################################
+# 4⃣ 检测 Docker 容器端口
+############################################
 if command -v docker &>/dev/null; then
-    echo -e "${YELLOW}5⃣ 检测 Docker 映射端口...${RESET}"
+    echo -e "${YELLOW}4⃣ 检测 Docker 映射端口...${RESET}"
     DOCKER_PORTS=$(docker ps --format '{{.Ports}}' | grep -Eo '[0-9]+->[0-9]+' | cut -d'>' -f1 | sort -u)
     for p in $DOCKER_PORTS; do
         [[ "$p" -gt 0 && "$p" -le 65535 ]] && ufw allow "${p}/tcp"
     done
 fi
 
-# Web/代理节点常用端口额外放行
-echo -e "${YELLOW}6⃣ 开放常见代理和网站端口...${RESET}"
-EXTRA_PORTS_TCP="443 80 8080 8443 10000 3000 5000 7000 8000 8888 9443 10085 10086"
-EXTRA_PORTS_UDP="443 53 1194 51820"
+############################################
+# 5⃣ 常见代理/Web端口
+############################################
+echo -e "${YELLOW}5⃣ 开放常见代理/Web端口...${RESET}"
+EXTRA_PORTS_TCP="8080 8443 10000 3000 5000 7000 8000 8888 9443 10085 10086"
+EXTRA_PORTS_UDP="53 1194 51820"
 for p in $EXTRA_PORTS_TCP; do ufw allow ${p}/tcp; done
 for p in $EXTRA_PORTS_UDP; do ufw allow ${p}/udp; done
 
-# SSH 防护
-echo -e "${YELLOW}7⃣ 启用 SSH 限速防护...${RESET}"
+############################################
+# 6⃣ SSH 防护
+############################################
+echo -e "${YELLOW}6⃣ 启用 SSH 限速防护...${RESET}"
 ufw limit 22/tcp
 
-# 简单防御（防 SYN Flood）
-echo -e "${YELLOW}8⃣ 启用简单网络防御规则...${RESET}"
+############################################
+# 7⃣ 简单 DDoS 防御
+############################################
+echo -e "${YELLOW}7⃣ 添加简单 DDoS 防御规则...${RESET}"
 iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
 iptables -A INPUT -f -j DROP
 iptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
 iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
 
-# 启用防火墙
+############################################
+# 8⃣ 安装并配置 Fail2Ban
+############################################
+echo -e "${YELLOW}8⃣ 安装并配置 Fail2Ban...${RESET}"
+apt install -y fail2ban
+
+cat >/etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime = 12h
+findtime = 10m
+maxretry = 5
+banaction = ufw
+backend = systemd
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+
+[nginx-http-auth]
+enabled = true
+
+[nginx-botsearch]
+enabled = true
+
+[nginx-req-limit]
+enabled = true
+
+[trojan]
+enabled = true
+port = 443
+protocol = tcp
+EOF
+
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+############################################
+# 9⃣ 启用防火墙
+############################################
 echo -e "${YELLOW}9⃣ 启用防火墙...${RESET}"
 ufw --force enable
 
-# 显示结果
-echo -e "${GREEN}🎉 防火墙设置完成，当前规则如下：${RESET}"
+echo -e "${GREEN}🎉 安全防护已完成，当前防火墙规则：${RESET}"
 ufw status verbose
+fail2ban-client status
