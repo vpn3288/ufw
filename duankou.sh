@@ -10,18 +10,15 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="3.1"
-SCRIPT_NAME="Smart Firewall Configuration Script"
-# 更新日志 v3.1:
-# - [BUGFIX] 修复了 get_listening_ports 函数中 awk 脚本的正则表达式语法错误 (unmatched parenthesis)。
-# - [IMPROVE] 加固了进程名提取逻辑的健壮性。
+SCRIPT_VERSION="4.0"
+SCRIPT_NAME="All-in-One Firewall Configuration Script"
+# 更新日志 v4.0:
+# - [FEATURE] 新增"防火墙大扫除"功能: 在脚本开始时自动禁用并清理 firewalld, nftables, 和所有 iptables 规则。
+# - [FEATURE] 专门为甲骨文云和其他带有复杂默认规则的VPS优化，确保UFW能接管防火墙。
+# - [IMPROVE] 调整主流程，将清理步骤置于最前，确保环境纯净。
 #
-# 更新日志 v3.0:
-# - 重构端口判断逻辑: 基于监听地址(公网/内网)而非端口号, 解决高位端口被忽略问题。
-# - 全面支持UDP: 同时检测并处理TCP和UDP端口。
-# - 引入受信任进程列表: 对nginx, xray, sing-box等进程的端口优先开放。
-# - 优化端口解析: 使用更健壮的awk脚本解析ss输出, 兼容IPv4/IPv6。
-# - 优化输出信息: 明确显示跳过端口的原因(如: 内部监听)。
+# 更新日志 v3.1:
+# - [BUGFIX] 修复了 get_listening_ports 函数中 awk 脚本的正则表达式语法错误。
 
 echo -e "${YELLOW}== 🔥 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
 
@@ -59,56 +56,26 @@ declare -A SERVICE_PORTS=(
     ["3000"]="Node.js-Dev" ["5000"]="Flask-Dev"
 )
 
-# 明确定义为内部服务的端口 (即使监听在公网地址, 也需要用户确认)
-INTERNAL_SERVICE_PORTS=(
-    631     # CUPS Printing
-)
-
-# 明确定义为危险的端口 (开放前需要强制确认)
-DANGEROUS_PORTS=(
-    23      # Telnet (极不安全)
-    135     # RPC Endpoint Mapper
-    139     # NetBIOS
-    445     # SMB
-    1433    # MSSQL (除非确实需要)
-    1521    # Oracle (除非确实需要)
-    3389    # RDP (高风险)
-    5432    # PostgreSQL (建议限制IP访问)
-    6379    # Redis (高风险, 易受攻击)
-    27017   # MongoDB (高风险, 易受攻击)
-)
-
 # 受信任的进程名 (这些进程监听的公网端口将被自动开放)
 TRUSTED_PROCESSES=(
     "nginx" "apache2" "httpd" "caddy" "haproxy" "lighttpd"
     "xray" "v2ray" "sing-box" "trojan-go" "hysteria"
     "ss-server" "ss-manager" "sslocal" "obfs-server"
-    "HiddifyCli" # 根据你的ss输出添加
-    "python" # 根据你的ss输出添加, 如果是公开服务
+    "HiddifyCli" "python" # 根据你的ss输出添加
 )
+
+# 明确定义为危险的端口 (开放前需要强制确认)
+DANGEROUS_PORTS=(23 135 139 445 1433 1521 3389 5432 6379 27017)
+
 
 # ==============================================================================
 # 辅助函数 (日志/错误/帮助等)
 # ==============================================================================
-
-debug_log() {
-    if [ "$DEBUG_MODE" = true ]; then
-        echo -e "${BLUE}[DEBUG] $1${RESET}" >&2
-    fi
-}
-error_exit() {
-    echo -e "${RED}❌ 错误: $1${RESET}" >&2
-    exit 1
-}
-warning() {
-    echo -e "${YELLOW}⚠️  警告: $1${RESET}" >&2
-}
-success() {
-    echo -e "${GREEN}✓ $1${RESET}"
-}
-info() {
-    echo -e "${CYAN}ℹ️  $1${RESET}"
-}
+debug_log() { if [ "$DEBUG_MODE" = true ]; then echo -e "${BLUE}[DEBUG] $1${RESET}" >&2; fi; }
+error_exit() { echo -e "${RED}❌ 错误: $1${RESET}" >&2; exit 1; }
+warning() { echo -e "${YELLOW}⚠️  警告: $1${RESET}" >&2; }
+success() { echo -e "${GREEN}✓ $1${RESET}"; }
+info() { echo -e "${CYAN}ℹ️  $1${RESET}"; }
 
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
@@ -125,47 +92,96 @@ parse_arguments() {
 show_help() {
     cat << EOF
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
-一个智能的防火墙自动配置脚本，能分析监听端口并自动生成UFW规则。
+一个全能的防火墙自动配置脚本。它会首先清理系统中其他防火墙，然后智能分析监听端口并自动生成UFW规则。
 
-用法: $0 [选项]
+用法: sudo $0 [选项]
 
 选项:
     --debug      启用调试模式，显示详细日志
     --force      强制模式，跳过所有交互式确认提示
     --dry-run    预演模式，显示将要执行的操作但不实际执行
     --help, -h   显示此帮助信息
-
-示例:
-    sudo $0                 # 正常运行
-    sudo $0 --dry-run         # 预演模式，强烈建议首次运行使用
-    sudo $0 --force --debug   # 强制模式 + 调试模式
-
 EOF
 }
 
 # ==============================================================================
-# 系统检查与环境准备
+# 防火墙清理、系统检查与环境准备
 # ==============================================================================
+
+purge_existing_firewalls() {
+    info "正在清理系统中可能存在的其他防火墙，以确保UFW能正常工作..."
+
+    echo -e "${YELLOW}=========================== 警告 ==========================="
+    echo -e "此步骤将禁用 firewalld, nftables 并清空所有 iptables 规则。"
+    echo -e "这是确保UFW能够唯一管理防火墙所必需的步骤。"
+    echo -e "${RED}注意: 此脚本无法修改云服务商(如甲骨文云, AWS, Google Cloud)"
+    echo -e "网页控制台中的“安全组”或“网络安全列表”规则。请确保"
+    echo -e "云平台级别的防火墙已放行您需要的端口（如SSH端口）。"
+    echo -e "==============================================================${RESET}"
+
+    if [ "$DRY_RUN" = true ]; then
+        info "[预演] 将会检测并尝试停止/禁用 firewalld 和 nftables 服务。"
+        info "[预演] 将会清空所有 iptables 和 ip6tables 规则。"
+        return
+    fi
+
+    # 禁用 firewalld
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        info "检测到正在运行的 firewalld，正在停止并禁用..."
+        systemctl stop firewalld
+        systemctl disable firewalld
+        systemctl mask firewalld 2>/dev/null || true
+        success "firewalld 已被禁用。"
+    fi
+
+    # 禁用 nftables
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nftables; then
+        info "检测到正在运行的 nftables，正在停止并禁用..."
+        systemctl stop nftables
+        systemctl disable nftables
+        success "nftables 已被禁用。"
+    fi
+
+    # 清理 iptables 和 ip6tables 规则
+    info "正在清空所有 iptables 和 ip6tables 规则..."
+    if command -v iptables >/dev/null 2>&1; then
+        # 设置默认策略为接受，防止ssh中断
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        # 清空所有表
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -F
+        iptables -X
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+        ip6tables -t nat -F
+        ip6tables -t mangle -F
+        ip6tables -F
+        ip6tables -X
+    fi
+    # 刷新 netfilter-persistent/iptables-persistent
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent flush 2>/dev/null || true
+    fi
+    success "iptables/ip6tables 规则已清空。"
+}
+
 
 check_system() {
     debug_log "检查系统环境"
-    if ! command -v ss >/dev/null 2>&1; then
-        error_exit "关键命令 'ss' 未找到。请安装 'iproute2' 包。"
-    fi
+    if ! command -v ss >/dev/null 2>&1; then error_exit "关键命令 'ss' 未找到。请安装 'iproute2' 包。"; fi
     if ! command -v ufw >/dev/null 2>&1; then
         warning "'ufw' 未找到。脚本将尝试安装它。"
-        if [ "$DRY_RUN" = true ]; then
-            info "[预演] 将安装: ufw"
-        else
-            if command -v apt-get >/dev/null 2>&1; then
-                DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y ufw
-            elif command -v dnf >/dev/null 2>&1; then
-                dnf install -y ufw
-            elif command -v yum >/dev/null 2>&1; then
-                yum install -y ufw
-            else
-                error_exit "无法自动安装 'ufw'。请手动安装后重试。"
-            fi
+        if [ "$DRY_RUN" = true ]; then info "[预演] 将安装: ufw"; else
+            if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y ufw;
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y ufw;
+            elif command -v yum >/dev/null 2>&1; then yum install -y ufw;
+            else error_exit "无法自动安装 'ufw'。请手动安装后重试。"; fi
         fi
     fi
     success "系统环境检查完成"
@@ -174,17 +190,12 @@ check_system() {
 create_backup() {
     debug_log "创建防火墙规则备份"
     BACKUP_DIR="/root/firewall_backup_$(date +%Y%m%d_%H%M%S)"
-    if [ "$DRY_RUN" = true ]; then
-        info "[预演] 将创建备份目录: $BACKUP_DIR"
-        return
-    fi
+    if [ "$DRY_RUN" = true ]; then info "[预演] 将创建备份目录: $BACKUP_DIR"; return; fi
     mkdir -p "$BACKUP_DIR"
     {
-        echo "# UFW Status Backup"
+        echo "# UFW Status Before Script Run"
         ufw status numbered 2>/dev/null || echo "UFW not enabled."
-        echo -e "\n# IPTables Rules Backup"
-        iptables-save 2>/dev/null || echo "iptables-save failed."
-        echo -e "\n# Listening Ports Backup"
+        echo -e "\n# Listening Ports"
         ss -tulnp
     } > "$BACKUP_DIR/firewall_state.bak"
     success "备份完成: $BACKUP_DIR"
@@ -198,144 +209,61 @@ detect_ssh_port() {
     debug_log "开始检测SSH端口"
     local ssh_port
     ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | head -n 1)
-    if [[ "$ssh_port" =~ ^[0-9]+$ ]]; then
-        debug_log "通过ss检测到sshd监听端口: $ssh_port"
-        echo "$ssh_port"
-        return
-    fi
-    # 后备方案
+    if [[ "$ssh_port" =~ ^[0-9]+$ ]]; then debug_log "通过ss检测到sshd监听端口: $ssh_port"; echo "$ssh_port"; return; fi
     ssh_port=$(grep -i '^Port' /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
-    if [[ "$ssh_port" =~ ^[0-9]+$ ]]; then
-        debug_log "通过sshd_config检测到端口: $ssh_port"
-        echo "$ssh_port"
-        return
-    fi
-    debug_log "未检测到非标准SSH端口，使用默认端口 22"
-    echo "22"
+    if [[ "$ssh_port" =~ ^[0-9]+$ ]]; then debug_log "通过sshd_config检测到端口: $ssh_port"; echo "$ssh_port"; return; fi
+    debug_log "未检测到非标准SSH端口，使用默认端口 22"; echo "22"
 }
 
 get_listening_ports() {
-    debug_log "获取系统所有TCP/UDP监听端口"
-    # 使用 awk 解析 ss -tulnp 的输出
-    # 格式: protocol:port:address:process
     ss -tulnp 2>/dev/null | awk '
     /LISTEN|UNCONN/ {
-        protocol = $1
-        listen_addr_port = $5
-
-        # 提取进程名，已修复正则表达式错误
+        protocol = $1; listen_addr_port = $5
         process = "unknown"
-        if (match($0, /users:\(\("([^"]+)"/, p)) {
-            process = p[1]
-        } else if (match($0, /\("([^"]+)",pid=/ , p)) { # <-- 此处是关键修正点
-            process = p[1]
-        }
-
-        # 分离地址和端口, 兼容IPv4和IPv6
+        if (match($0, /users:\(\("([^"]+)"/, p)) { process = p[1] } 
+        else if (match($0, /\("([^"]+)",pid=/ , p)) { process = p[1] }
         if (match(listen_addr_port, /^(.*):([0-9]+)$/, parts)) {
-            address = parts[1]
-            port = parts[2]
-
-            # 清理IPv6地址格式
-            if (address ~ /^\[.*\]$/) {
-                address = substr(address, 2, length(address)-2)
-            }
-            # 将 '*' 转换为更易读的 '0.0.0.0'
-            if (address == "*") {
-                address = "0.0.0.0"
-            }
-
+            address = parts[1]; port = parts[2]
+            if (address ~ /^\[.*\]$/) { address = substr(address, 2, length(address)-2) }
+            if (address == "*") { address = "0.0.0.0" }
             if (port > 0 && port <= 65535) {
-                # 去除重复行
                 line = protocol ":" port ":" address ":" process
-                if (!seen[line]++) {
-                    print line
-                }
+                if (!seen[line]++) { print line }
             }
         }
     }'
 }
 
 is_public_listener() {
-    local address=$1
-    case "$address" in
-        "127.0.0.1"|"::1"|"localhost"|127.*)
-            return 1 # 否, 是内部监听
-            ;;
-        *)
-            return 0 # 是, 是公网监听
-            ;;
-    esac
+    case "$1" in "127.0.0.1"|"::1"|"localhost"|127.*) return 1 ;; *) return 0 ;; esac
 }
 
 analyze_port() {
-    local protocol=$1 port=$2 address=$3 process=$4
-    local reason=""
-
+    local protocol=$1 port=$2 address=$3 process=$4 reason=""
     debug_log "分析端口: $protocol/$port, 地址: $address, 进程: $process"
-
-    # 规则1: SSH端口由专门的函数处理, 此处跳过
-    if [ "$port" = "$SSH_PORT" ]; then
-        reason="SSH端口，单独处理"
-        echo "skip:$reason"
-        return
-    fi
-
-    # 规则2: 非公网监听的端口一律跳过
-    if ! is_public_listener "$address"; then
-        reason="内部监听于 $address"
-        echo "skip:$reason"
-        return
-    fi
-
-    # 规则3: 检查是否为受信任的进程 (如 nginx, xray, sing-box)
+    if [ "$port" = "$SSH_PORT" ]; then reason="SSH端口，单独处理"; echo "skip:$reason"; return; fi
+    if ! is_public_listener "$address"; then reason="内部监听于 $address"; echo "skip:$reason"; return; fi
     for trusted_proc in "${TRUSTED_PROCESSES[@]}"; do
-        if [[ "$process" == "$trusted_proc" ]]; then
-            reason="受信任的进程 ($process)"
-            echo "open:$reason"
-            return
-        fi
+        if [[ "$process" == "$trusted_proc" ]]; then reason="受信任的进程 ($process)"; echo "open:$reason"; return; fi
     done
-
-    # 规则4: 检查是否为明确定义的内部服务端口
-    for internal_serv_port in "${INTERNAL_SERVICE_PORTS[@]}"; do
-        if [ "$port" = "$internal_serv_port" ]; then
-            reason="内部服务端口 ($service_name)"
-            echo "skip:$reason"
-            return
-        fi
-    done
-
-    # 规则 5: 检查是否为危险端口, 需要用户交互确认
     for dangerous_port in "${DANGEROUS_PORTS[@]}"; do
         if [ "$port" = "$dangerous_port" ]; then
             local service_name=${SERVICE_PORTS[$port]:-"Unknown"}
             warning "检测到潜在危险端口 $port ($service_name) 由进程 '$process' 监听。"
             if [ "$FORCE_MODE" = true ]; then
-                warning "强制模式已启用，自动开放危险端口 $port。"
-                reason="危险端口 (强制开放)"
-                echo "open:$reason"
+                warning "强制模式已启用，自动开放危险端口 $port。"; reason="危险端口 (强制开放)"; echo "open:$reason"
             else
                 read -p "你是否确认要向公网开放此端口? 这可能带来安全风险。 [y/N]: " -r response
                 if [[ "$response" =~ ^[yY]([eE][sS])?$ ]]; then
-                    info "用户确认开放危险端口 $port"
-                    reason="危险端口 (用户确认)"
-                    echo "open:$reason"
+                    info "用户确认开放危险端口 $port"; reason="危险端口 (用户确认)"; echo "open:$reason"
                 else
-                    info "用户拒绝开放危险端口 $port"
-                    reason="危险端口 (用户拒绝)"
-                    echo "skip:$reason"
+                    info "用户拒绝开放危险端口 $port"; reason="危险端口 (用户拒绝)"; echo "skip:$reason"
                 fi
-            fi
-            return
+            fi; return
         fi
     done
-
-    # 规则 6: 对于其他所有公网监听的端口, 默认开放 (根据用户需求)
-    reason="公网服务 ($process)"
-    echo "open:$reason"
+    reason="公网服务 ($process)"; echo "open:$reason"
 }
-
 
 # ==============================================================================
 # 防火墙操作
@@ -343,10 +271,7 @@ analyze_port() {
 
 setup_basic_firewall() {
     info "配置UFW基础规则..."
-    if [ "$DRY_RUN" = true ]; then
-        info "[预演] 将重置UFW, 设置默认策略 (deny incoming, allow outgoing)"
-        return
-    fi
+    if [ "$DRY_RUN" = true ]; then info "[预演] 将重置UFW, 设置默认策略 (deny incoming, allow outgoing)"; return; fi
     ufw --force reset >/dev/null
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
@@ -355,103 +280,53 @@ setup_basic_firewall() {
 
 setup_ssh_access() {
     info "配置SSH访问端口 $SSH_PORT..."
-    if [ "$DRY_RUN" = true ]; then
-        info "[预演] 将允许并限制 (limit) SSH端口 $SSH_PORT/tcp"
-        return
-    fi
+    if [ "$DRY_RUN" = true ]; then info "[预演] 将允许并限制 (limit) SSH端口 $SSH_PORT/tcp"; return; fi
     ufw allow $SSH_PORT/tcp >/dev/null
     ufw limit $SSH_PORT/tcp >/dev/null
     success "SSH端口 $SSH_PORT/tcp 已配置访问限制"
 }
 
-open_single_port() {
-    local protocol=$1 port=$2 reason=$3
-    local service_name=${SERVICE_PORTS[$port]:-"自定义服务"}
-
-    if [ "$DRY_RUN" = true ]; then
-        info "[预演] ${GREEN}开放: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${GREEN} (原因: $reason)${RESET}"
-        OPENED_PORTS=$((OPENED_PORTS + 1))
-        return
-    fi
-
-    if ufw allow "$port/$protocol" >/dev/null; then
-        echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${GREEN} (原因: $reason)${RESET}"
-        OPENED_PORTS=$((OPENED_PORTS + 1))
-    else
-        echo -e "  ${RED}✗ 失败: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${RESET}"
-        FAILED_PORTS=$((FAILED_PORTS + 1))
-    fi
-}
-
 process_ports() {
     info "开始分析和处理所有监听端口..."
-    local port_data
-    port_data=$(get_listening_ports)
-
-    if [ -z "$port_data" ]; then
-        info "未检测到需要处理的监听端口。"
-        return
-    fi
-
+    local port_data; port_data=$(get_listening_ports)
+    if [ -z "$port_data" ]; then info "未检测到需要处理的监听端口。"; return; fi
+    
     echo "$port_data" | while IFS=: read -r protocol port address process; do
         [ -z "$port" ] && continue
-
-        local analysis_result
-        analysis_result=$(analyze_port "$protocol" "$port" "$address" "$process")
-        
-        local action="${analysis_result%%:*}"
-        local reason="${analysis_result#*:}"
-
+        local analysis_result; analysis_result=$(analyze_port "$protocol" "$port" "$address" "$process")
+        local action="${analysis_result%%:*}"; local reason="${analysis_result#*:}"
         if [ "$action" = "open" ]; then
-            open_single_port "$protocol" "$port" "$reason"
+            local service_name=${SERVICE_PORTS[$port]:-"自定义服务"}
+            if [ "$DRY_RUN" = true ]; then
+                info "[预演] ${GREEN}开放: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${GREEN} (原因: $reason)${RESET}"; OPENED_PORTS=$((OPENED_PORTS + 1))
+            elif ufw allow "$port/$protocol" >/dev/null; then
+                echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${GREEN} (原因: $reason)${RESET}"; OPENED_PORTS=$((OPENED_PORTS + 1))
+            else
+                echo -e "  ${RED}✗ 失败: ${CYAN}$port/$protocol${GREEN} - ${YELLOW}$service_name${RESET}"; FAILED_PORTS=$((FAILED_PORTS + 1))
+            fi
         else
             local service_name=${SERVICE_PORTS[$port]:-"自定义服务"}
-            echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - ${YELLOW}$service_name${BLUE} (原因: $reason)${RESET}"
-            SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
+            echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - ${YELLOW}$service_name${BLUE} (原因: $reason)${RESET}"; SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
         fi
     done
 }
 
 enable_firewall() {
     info "最后一步：启用防火墙..."
-    if [ "$DRY_RUN" = true ]; then
-        info "[预演] 将执行 'ufw enable'"
-        return
-    fi
-
-    if ufw --force enable | grep -q "Firewall is active"; then
-        success "防火墙已成功激活并将在系统启动时自启"
-    else
-        error_exit "启用防火墙失败! 请检查UFW状态。"
-    fi
+    if [ "$DRY_RUN" = true ]; then info "[预演] 将执行 'ufw enable'"; return; fi
+    if ufw --force enable | grep -q "Firewall is active"; then success "防火墙已成功激活并将在系统启动时自启";
+    else error_exit "启用防火墙失败! 请检查UFW状态。"; fi
 }
 
 show_final_status() {
-    echo -e "\n${GREEN}======================================"
-    echo -e "🎉 防火墙配置完成！"
-    echo -e "======================================${RESET}"
-
-    echo -e "${YELLOW}配置统计：${RESET}"
-    echo -e "  - ${GREEN}成功开放端口: $OPENED_PORTS${RESET}"
-    echo -e "  - ${BLUE}跳过内部/受限端口: $SKIPPED_PORTS${RESET}"
-    echo -e "  - ${RED}失败端口: $FAILED_PORTS${RESET}"
-
+    echo -e "\n${GREEN}======================================"; echo -e "🎉 防火墙配置完成！"; echo -e "======================================${RESET}"
+    echo -e "${YELLOW}配置统计：${RESET}"; echo -e "  - ${GREEN}成功开放端口: $OPENED_PORTS${RESET}"; echo -e "  - ${BLUE}跳过内部/受限端口: $SKIPPED_PORTS${RESET}"; echo -e "  - ${RED}失败端口: $FAILED_PORTS${RESET}"
     if [ "$DRY_RUN" = true ]; then
-        echo -e "\n${CYAN}>>> 预演模式结束，未对系统做任何实际更改 <<<\n${RESET}"
-        echo -e "${YELLOW}如果以上预演结果符合预期，请移除 '--dry-run' 参数以正式执行。${RESET}"
-        return
+        echo -e "\n${CYAN}>>> 预演模式结束，未对系统做任何实际更改 <<<\n${RESET}"; echo -e "${YELLOW}如果以上预演结果符合预期，请移除 '--dry-run' 参数以正式执行。${RESET}"; return
     fi
-
-    echo -e "\n${YELLOW}当前防火墙状态 (ufw status numbered):${RESET}"
-    ufw status numbered
-
-    echo -e "\n${YELLOW}🔒 安全提醒：${RESET}"
-    echo -e "  - SSH端口 ${CYAN}$SSH_PORT${YELLOW} 已启用暴力破解防护 (limit)。"
-    echo -e "  - 配置备份已保存至 ${CYAN}$BACKUP_DIR${YELLOW}。"
-    echo -e "  - 建议定期使用 ${CYAN}'sudo ufw status'${YELLOW} 审查防火墙规则。"
-    echo -e "  - 为进一步提高安全性，请考虑安装 ${CYAN}fail2ban${YELLOW}。"
+    echo -e "\n${YELLOW}当前防火墙状态 (ufw status numbered):${RESET}"; ufw status numbered
+    echo -e "\n${YELLOW}🔒 安全提醒：${RESET}"; echo -e "  - SSH端口 ${CYAN}$SSH_PORT${YELLOW} 已启用暴力破解防护 (limit)。"; echo -e "  - 配置备份已保存至 ${CYAN}$BACKUP_DIR${YELLOW}。"; echo -e "  - 建议定期使用 ${CYAN}'sudo ufw status'${YELLOW} 审查防火墙规则。"
 }
-
 
 # ==============================================================================
 # 主函数与信号处理
@@ -460,34 +335,39 @@ show_final_status() {
 main() {
     trap 'echo -e "\n${RED}操作被中断。${RESET}"; exit 130' INT TERM
     
+    # 步骤 0: 解析命令行参数
     parse_arguments "$@"
 
-    # 步骤 1: 环境检查
-    echo -e "\n${CYAN}--- 1. 检查系统环境 ---${RESET}"
+    # 步骤 1: 清理现有防火墙 (新功能!)
+    echo -e "\n${CYAN}--- 1. 清理现有防火墙规则 ---${RESET}"
+    purge_existing_firewalls
+
+    # 步骤 2: 环境检查
+    echo -e "\n${CYAN}--- 2. 检查系统环境与依赖 ---${RESET}"
     check_system
 
-    # 步骤 2: 备份
-    echo -e "\n${CYAN}--- 2. 备份当前防火墙规则 ---${RESET}"
+    # 步骤 3: 备份
+    echo -e "\n${CYAN}--- 3. 备份信息 ---${RESET}"
     create_backup
 
-    # 步骤 3: 基础配置
-    echo -e "\n${CYAN}--- 3. 配置UFW基础环境 ---${RESET}"
+    # 步骤 4: UFW 基础配置
+    echo -e "\n${CYAN}--- 4. 配置UFW基础环境 ---${RESET}"
     setup_basic_firewall
 
-    # 步骤 4: 处理SSH
+    # 步骤 5: 处理SSH
     SSH_PORT=$(detect_ssh_port)
-    echo -e "\n${CYAN}--- 4. 配置SSH端口 ($SSH_PORT) ---${RESET}"
+    echo -e "\n${CYAN}--- 5. 配置SSH端口 ($SSH_PORT) ---${RESET}"
     setup_ssh_access
 
-    # 步骤 5: 核心 - 处理所有其他端口
-    echo -e "\n${CYAN}--- 5. 智能分析并配置所有服务端口 ---${RESET}"
+    # 步骤 6: 核心 - 处理所有其他端口
+    echo -e "\n${CYAN}--- 6. 智能分析并配置所有服务端口 ---${RESET}"
     process_ports
 
-    # 步骤 6: 启用防火墙
-    echo -e "\n${CYAN}--- 6. 启用防火墙 ---${RESET}"
+    # 步骤 7: 启用防火墙
+    echo -e "\n${CYAN}--- 7. 启用防火墙 ---${RESET}"
     enable_firewall
 
-    # 步骤 7: 显示最终报告
+    # 步骤 8: 显示最终报告
     show_final_status
     
     echo -e "\n${GREEN}✨ 脚本执行完毕！${RESET}"
