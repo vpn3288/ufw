@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="5.2 (修复版)"
+SCRIPT_VERSION="5.3 (最终修复版)"
 SCRIPT_NAME="代理服务器智能防火墙脚本 (nftables版)"
 
 echo -e "${YELLOW}== 🔥 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
@@ -162,7 +162,6 @@ check_system() {
         error_exit "缺少 'ss' 命令，请安装 'iproute2'"
     fi
 
-    # [修复] 检查并安装 jq
     if ! command -v jq >/dev/null 2>&1; then
         info "缺少 'jq' 命令，尝试安装以支持配置文件解析..."
         if [ "$DRY_RUN" = true ]; then
@@ -323,10 +322,16 @@ get_ports_from_config() {
         if [ -f "$config_file" ]; then
             debug_log "解析文件: $config_file"
             
-            # 使用 jq 解析并提取端口
+            # [修复] 修复了长命令的换行符语法错误
             local ports
-            # 兼容多种格式：listen:port, port, inbounds[].port 等
-            ports=$(jq -r '[.inbounds[]? | select(.port!=null) | .port, .inbounds[]? | select(.listen!=null) | .listen, .listen_port? // null] | flatten | unique | .[] | select(type=="number" or (type=="string" and (test("^[0-9]+$") or test("^[0-9]+-[0-9]+$"))))' "$config_file" 2>/dev/null)
+            ports=$(jq -r '
+                [
+                    .inbounds[]? | select(.port!=null) | .port,
+                    .inbounds[]? | select(.listen!=null) | .listen,
+                    .listen_port? // null
+                ] | flatten | unique | .[] |
+                select(type=="number" or (type=="string" and (test("^[0-9]+$") or test("^[0-9]+-[0-9]+$"))))
+            ' "$config_file" 2>/dev/null)
             
             if [ -n "$ports" ]; then
                 for port in $ports; do
@@ -378,7 +383,6 @@ is_system_reserved_port() {
     return 1
 }
 
-# [修复] 增加对Web服务器进程的识别
 is_proxy_or_web_process() {
     local process="$1"
     local pid="$2"
@@ -456,7 +460,7 @@ analyze_port() {
         return
     fi
     
-    # [修复] 优先级最高：检查是否为配置文件中定义的端口
+    # 优先级最高：检查是否为配置文件中定义的端口
     if [[ " ${CONFIG_PORTS_LIST[@]} " =~ " $port " ]]; then
         echo "open:配置文件定义($process)"
         return
@@ -637,7 +641,6 @@ process_ports() {
     total_ports=$(echo "$port_data" | wc -l)
     info "检测到 $total_ports 个监听端口"
     
-    # [修复] 修复子shell问题，使用进程替换 < <(...)
     while IFS=: read -r protocol port address process pid; do
         [ -z "$port" ] && continue
         
@@ -651,7 +654,6 @@ process_ports() {
         
     done < <(echo "$port_data")
 
-    # [修复] 统一从临时文件读取并更新变量
     if [ -f "/tmp/port_analysis_results" ]; then
         while IFS=: read -r action port protocol reason process; do
             if [ "$action" = "open" ]; then
@@ -661,7 +663,6 @@ process_ports() {
                 SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
                 SKIPPED_PORTS_LIST+=("$port/$protocol ($reason)")
             fi
-            # 显示实时分析结果
             if [ "$action" = "open" ]; then
                 echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - $reason${RESET}"
                 add_port_rule "$port" "$protocol" "$reason"
@@ -683,7 +684,6 @@ show_final_status() {
     echo -e "  - ${BLUE}跳过端口: $SKIPPED_PORTS${RESET}"
     echo -e "  - ${CYAN}SSH端口: $SSH_PORT (已启用暴力破解保护)${RESET}"
     
-    # 显示详细的开放端口列表
     if [ ${#OPENED_PORTS_LIST[@]} -gt 0 ]; then
         echo -e "\n${GREEN}✅ 已开放的端口：${RESET}"
         for port_info in "${OPENED_PORTS_LIST[@]}"; do
@@ -697,7 +697,6 @@ show_final_status() {
         echo -e "    - 用户选择不开放"
     fi
     
-    # 显示跳过端口的原因
     if [ ${#SKIPPED_PORTS_LIST[@]} -gt 0 ]; then
         echo -e "\n${BLUE}ℹ️ 跳过的端口：${RESET}"
         for port_info in "${SKIPPED_PORTS_LIST[@]}"; do
@@ -712,7 +711,6 @@ show_final_status() {
     
     echo -e "\n${YELLOW}当前防火墙规则：${RESET}"
     if command -v nft >/dev/null 2>&1; then
-        # 显示所有允许的端口规则
         local rule_count=0
         while IFS= read -r line; do
             if [[ "$line" == *"dport"* && "$line" == *"accept"* ]]; then
@@ -741,7 +739,6 @@ show_final_status() {
     echo -e "  - 禁用防火墙: ${YELLOW}sudo systemctl stop nftables${RESET}"
     echo -e "  - 手动添加端口: ${YELLOW}sudo nft add rule inet filter input tcp dport [端口] accept${RESET}"
     
-    # 如果没有代理端口被开放，给出建议
     if [ ${#OPENED_PORTS_LIST[@]} -eq 0 ]; then
         echo -e "\n${YELLOW}🔧 故障排除建议：${RESET}"
         echo -e "  1. 确认代理服务正在运行: ${CYAN}sudo systemctl status xray v2ray sing-box${RESET}"
@@ -773,7 +770,6 @@ main() {
     echo -e "\n${CYAN}--- 4. 配置基础防火墙 ---${RESET}"
     setup_nftables
 
-    # [修复] 在处理端口之前，先从配置文件中提取端口
     get_ports_from_config
     
     echo -e "\n${CYAN}--- 5. 分析和处理端口 ---${RESET}"
