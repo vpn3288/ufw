@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="5.1"
+SCRIPT_VERSION="5.2 (修复版)"
 SCRIPT_NAME="代理服务器智能防火墙脚本 (nftables版)"
 
 echo -e "${YELLOW}== 🔥 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
@@ -32,6 +32,9 @@ SKIPPED_PORTS=0
 # 端口记录数组
 declare -a OPENED_PORTS_LIST=()
 declare -a SKIPPED_PORTS_LIST=()
+
+# 新增全局数组，用于存储从配置文件中检测到的端口
+declare -a CONFIG_PORTS_LIST=()
 
 # ==============================================================================
 # 核心配置数据库
@@ -117,7 +120,7 @@ parse_arguments() {
             --dry-run) DRY_RUN=true; info "预演模式已启用"; shift ;;
             --help|-h) show_help; exit 0 ;;
             *) error_exit "未知参数: $1" ;;
-        esac
+        es-ac
     done
 }
 
@@ -157,6 +160,24 @@ check_system() {
     
     if ! command -v ss >/dev/null 2>&1; then 
         error_exit "缺少 'ss' 命令，请安装 'iproute2'"
+    fi
+
+    # [修复] 检查并安装 jq
+    if ! command -v jq >/dev/null 2>&1; then
+        info "缺少 'jq' 命令，尝试安装以支持配置文件解析..."
+        if [ "$DRY_RUN" = true ]; then
+            info "[预演] 将安装 jq"
+        else
+            if command -v apt-get >/dev/null 2>&1; then 
+                apt-get update -y && apt-get install -y jq
+            elif command -v dnf >/dev/null 2>&1; then 
+                dnf install -y jq
+            elif command -v yum >/dev/null 2>&1; then 
+                yum install -y jq
+            else 
+                warning "无法自动安装 jq，配置文件端口检测功能将无法使用"
+            fi
+        fi
     fi
     
     if ! command -v nft >/dev/null 2>&1; then
@@ -290,6 +311,48 @@ get_listening_ports() {
     }'
 }
 
+# [修复] 新增函数：从配置文件中解析端口
+get_ports_from_config() {
+    if ! command -v jq >/dev/null 2>&1; then
+        return
+    fi
+    
+    info "正在从代理配置文件中解析端口..."
+    
+    for config_file in "${CONFIG_PATHS[@]}"; do
+        if [ -f "$config_file" ]; then
+            debug_log "解析文件: $config_file"
+            
+            # 使用 jq 解析并提取端口
+            local ports
+            # 兼容多种格式：listen:port, port, inbounds[].port 等
+            ports=$(jq -r '[.inbounds[]? | select(.port!=null) | .port, .inbounds[]? | select(.listen!=null) | .listen, .listen_port? // null] | flatten | unique | .[] | select(type=="number" or (type=="string" and (test("^[0-9]+$") or test("^[0-9]+-[0-9]+$"))))' "$config_file" 2>/dev/null)
+            
+            if [ -n "$ports" ]; then
+                for port in $ports; do
+                    # 处理端口范围
+                    if [[ "$port" == *"-"* ]]; then
+                        local start=${port%-*}
+                        local end=${port#*-}
+                        for ((p=start; p<=end; p++)); do
+                            CONFIG_PORTS_LIST+=("$p")
+                        done
+                    else
+                        CONFIG_PORTS_LIST+=("$port")
+                    fi
+                done
+            fi
+        fi
+    done
+    
+    # 去重
+    CONFIG_PORTS_LIST=($(printf "%s\n" "${CONFIG_PORTS_LIST[@]}" | sort -u))
+    
+    if [ ${#CONFIG_PORTS_LIST[@]} -gt 0 ]; then
+        info "从配置文件中找到以下端口: ${CONFIG_PORTS_LIST[*]}"
+    fi
+}
+
 is_public_listener() {
     local address="$1"
     case "$address" in 
@@ -315,22 +378,15 @@ is_system_reserved_port() {
     return 1
 }
 
-is_proxy_process() {
+# [修复] 增加对Web服务器进程的识别
+is_proxy_or_web_process() {
     local process="$1"
     local pid="$2"
     
     # 精确匹配
-    for proxy_proc in "${PROXY_PROCESSES[@]}"; do
+    for proxy_proc in "${PROXY_PROCESSES[@]}" "${WEB_PROCESSES[@]}"; do
         if [[ "$process" == "$proxy_proc" ]]; then
-            debug_log "进程 '$process' 匹配代理软件 (精确)"
-            return 0
-        fi
-    done
-    
-    # Web服务器匹配
-    for web_proc in "${WEB_PROCESSES[@]}"; do
-        if [[ "$process" == "$web_proc" ]]; then
-            debug_log "进程 '$process' 匹配Web服务器"
+            debug_log "进程 '$process' 匹配代理或Web软件 (精确)"
             return 0
         fi
     done
@@ -348,9 +404,9 @@ is_proxy_process() {
         local cmdline
         cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
         
-        for proxy_proc in "${PROXY_PROCESSES[@]}"; do
+        for proxy_proc in "${PROXY_PROCESSES[@]}" "${WEB_PROCESSES[@]}"; do
             if [[ "$cmdline" == *"$proxy_proc"* ]]; then
-                debug_log "进程命令行包含代理软件: $proxy_proc"
+                debug_log "进程命令行包含代理或Web软件: $proxy_proc"
                 return 0
             fi
         done
@@ -400,6 +456,18 @@ analyze_port() {
         return
     fi
     
+    # [修复] 优先级最高：检查是否为配置文件中定义的端口
+    if [[ " ${CONFIG_PORTS_LIST[@]} " =~ " $port " ]]; then
+        echo "open:配置文件定义($process)"
+        return
+    fi
+    
+    # 代理或Web进程端口开放
+    if is_proxy_or_web_process "$process" "$pid"; then
+        echo "open:代理或Web服务($process)"
+        return
+    fi
+    
     # 危险端口需要确认
     if is_dangerous_port "$port"; then
         if [ "$FORCE_MODE" = true ]; then
@@ -415,12 +483,6 @@ analyze_port() {
             fi
             return
         fi
-    fi
-    
-    # 代理进程端口开放
-    if is_proxy_process "$process" "$pid"; then
-        echo "open:代理服务($process)"
-        return
     fi
     
     # 其他公网端口需要确认
@@ -575,31 +637,22 @@ process_ports() {
     total_ports=$(echo "$port_data" | wc -l)
     info "检测到 $total_ports 个监听端口"
     
-    # 修复：使用临时文件避免子shell问题
-    local temp_file="/tmp/port_analysis_results"
-    > "$temp_file"
-    
-    echo "$port_data" | while IFS=: read -r protocol port address process pid; do
+    # [修复] 修复子shell问题，使用进程替换 < <(...)
+    while IFS=: read -r protocol port address process pid; do
         [ -z "$port" ] && continue
         
         local result
         result=$(analyze_port "$protocol" "$port" "$address" "$process" "$pid")
         local action="${result%%:*}"
         local reason="${result#*:}"
-        
+
         # 记录处理结果到临时文件
-        echo "$action:$port:$protocol:$reason:$process" >> "$temp_file"
+        echo "$action:$port:$protocol:$reason:$process" >> /tmp/port_analysis_results
         
-        if [ "$action" = "open" ]; then
-            echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - $reason${RESET}"
-            add_port_rule "$port" "$protocol" "$reason"
-        else
-            echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - $reason${RESET}"
-        fi
-    done
-    
-    # 从临时文件读取统计信息
-    if [ -f "$temp_file" ]; then
+    done < <(echo "$port_data")
+
+    # [修复] 统一从临时文件读取并更新变量
+    if [ -f "/tmp/port_analysis_results" ]; then
         while IFS=: read -r action port protocol reason process; do
             if [ "$action" = "open" ]; then
                 OPENED_PORTS=$((OPENED_PORTS + 1))
@@ -608,8 +661,15 @@ process_ports() {
                 SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
                 SKIPPED_PORTS_LIST+=("$port/$protocol ($reason)")
             fi
-        done < "$temp_file"
-        rm -f "$temp_file"
+            # 显示实时分析结果
+            if [ "$action" = "open" ]; then
+                echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - $reason${RESET}"
+                add_port_rule "$port" "$protocol" "$reason"
+            else
+                echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - $reason${RESET}"
+            fi
+        done < "/tmp/port_analysis_results"
+        rm -f "/tmp/port_analysis_results"
     fi
 }
 
@@ -633,7 +693,7 @@ show_final_status() {
         echo -e "\n${YELLOW}⚠️ 没有代理端口被自动开放！${RESET}"
         echo -e "  ${YELLOW}可能原因：${RESET}"
         echo -e "    - 代理服务未运行或监听在内网地址"
-        echo -e "    - 进程名不在预定义列表中"
+        echo -e "    - 进程名不在预定义列表中，且配置文件无法解析"
         echo -e "    - 用户选择不开放"
     fi
     
@@ -712,6 +772,9 @@ main() {
     
     echo -e "\n${CYAN}--- 4. 配置基础防火墙 ---${RESET}"
     setup_nftables
+
+    # [修复] 在处理端口之前，先从配置文件中提取端口
+    get_ports_from_config
     
     echo -e "\n${CYAN}--- 5. 分析和处理端口 ---${RESET}"
     process_ports
