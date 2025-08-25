@@ -1068,10 +1068,27 @@ main() {
     
     # 最终提醒
     if [ "$FORCE_MODE" = false ] && [ ${#OPENED_PORTS_LIST[@]} -eq 0 ]; then
-        echo -e "\n${YELLOW}💡 提示: 如果你确定要开放所有检测到的代理端口，可以使用:${RESET}"
-        echo -e "${CYAN}bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/ufw/refs/heads/main/duankou.sh) --force${RESET}"
-    fi
+    echo -e "  ${YELLOW}删除规则:${RESET} sudo nft -a list ruleset (查看句柄), sudo nft delete rule inet filter input handle [句柄]"
+    
+    echo -e "\n${GREEN}🎯 脚本执行完毕，代理端口已开放，可以正常对外提供服务！${RESET}"
 }
 
-# 脚本入口点
+# ============================================================================== 
+# 主程序入口
+# ============================================================================== 
+
+main() {
+    parse_arguments "$@"
+    check_system
+    cleanup_existing_firewalls
+    
+    SSH_PORT=$(detect_ssh_port)
+    info "检测到 SSH 端口: ${YELLOW}$SSH_PORT${RESET}"
+    
+    setup_nftables
+    process_ports
+    apply_nftables_rules
+    show_final_status
+}
+
 main "$@"
