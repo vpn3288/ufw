@@ -1,123 +1,4 @@
-process_ports() {
-    info "开始分析监听端口和配置文件..."
-    
-    # 初始化临时文件
-    > "$TEMP_RESULTS"
-    
-    # 1. 获取监听端口
-    local listening_data
-    listening_data=$(get_listening_ports)
-    
-    # 2. 获取配置文件端口
-    local config_data
-    config_data=$(extract_ports_from_configs)
-    
-    # 统计信息
-    local listening_count=0
-    local config_count=0
-    
-    if [ -n "$listening_data" ]; then
-        listening_count=$(echo "$listening_data" | wc -l)
-    fi
-    
-    if [ -n "$config_data" ]; then
-        config_count=$(echo "$config_data" | wc -l)
-    fi
-    
-    info "检测到 $listening_count 个监听端口, $config_count 个配置文件端口"
-    
-    # 处理监听端口
-    if [ -n "$listening_data" ]; then
-        echo "$listening_data" | while IFS=: read -r protocol port address process pid; do
-            [ -z "$port" ] && continue
-            
-            local result
-            result=$(analyze_port "$protocol" "$port" "$address" "$process" "$pid" "listening")
-            local action="${result%%:*}"
-            local reason="${result#*:}"
-            
-            # 写入结果到临时文件
-            echo "$action:$port:$protocol:$reason:$process" >> "$TEMP_RESULTS"
-            
-            if [ "$action" = "open" ]; then
-                echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - $reason${RESET}"
-                add_port_rule "$port" "$protocol" "$reason"
-            else
-                echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - $reason${RESET}"
-            fi
-        done
-    fi
-    
-    # 处理配置文件端口
-    if [ -n "$config_data" ]; then
-        echo -e "\n${YELLOW}处理配置文件中的端口:${RESET}"
-        echo "$config_data" | while IFS=: read -r port source config_file; do
-            [ -z "$port" ] && continue
-            
-            # 检查是否已经在监听端口中处理过
-            if [ -n "$listening_data" ] && echo "$listening_data" | grep -q ":$port:"; then
-                debug_log "端口 $port 已在监听端口中处理，跳过"
-                continue
-            fi
-            
-            local result
-            result=$(analyze_port "tcp" "$port" "config" "config-file" "" "config")
-            local action="${result%%:*}"
-            local reason="${result#*:}"
-            
-            # 写入结果到临时文件
-            echo "$action:$port:tcp:$reason:config($(basename "$config_file"))" >> "$TEMP_RESULTS"
-            
-            if [ "$action" = "open" ]; then
-                echo -e "  ${GREEN}✓ 配置: ${CYAN}$port/tcp${GREEN} - $reason${RESET}"
-                add_port_rule "$port" "tcp" "$reason"
-                # 同时添加UDP规则 (某些代理需要)
-                add_port_rule "$port" "udp" "$reason"
-            else
-                echo -e "  ${BLUE}⏭️ 跳过配置: ${CYAN}$port/tcp${BLUE} - $reason${RESET}"
-            fi
-        done
-    fi
-    
-    # 从结果文件统计数据 (解决子shell变量问题)
-    if [ -f "$TEMP_RESULTS" ]; then
-        while IFS=: read -r action port protocol reason process; do
-            [ -z "$action" ] && continue
-            if [ "$action" = "open" ]; then
-                OPENED_PORTS=$((OPENED_PORTS + 1))
-                OPENED_PORTS_LIST+=("$port/$protocol ($process)")
-            else
-                SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
-                SKIPPED_PORTS_LIST+=("$port/$protocol ($reason)")
-            fi
-        done < "$TEMP_RESULTS"
-    fi
-    
-    # 统计手动添加的端口
-    local manual_count=0
-    manual_count=$((${#PORT_RANGES_TCP[@]} + ${#PORT_RANGES_UDP[@]} + ${#SINGLE_PORTS_TCP[@]} + ${#SINGLE_PORTS_UDP[@]}))
-    
-    if [ $manual_count -gt 0 ]; then
-        OPENED_PORTS=$((OPENED_PORTS + manual_count))
-        
-        # 添加手动端口到显示列表
-        for range in "${PORT_RANGES_TCP[@]}"; do
-            OPENED_PORTS_LIST+=("$range/tcp (手动范围)")
-        done
-        for range in "${PORT_RANGES_UDP[@]}"; do
-            OPENED_PORTS_LIST+=("$range/udp (手动范围)")
-        done
-        for port in "${SINGLE_PORTS_TCP[@]}"; do
-            OPENED_PORTS_LIST+=("$port/tcp (手动端口)")
-        done
-        for port in "${SINGLE_PORTS_UDP[@]}"; do
-            OPENED_PORTS_LIST+=("$port/udp (手动端口)")
-        done
-    fi
-    
-    info "端口处理完成: 开放 $OPENED_PORTS 个, 跳过 $SKIPPED_PORTS 个"
-}
-    #!/bin/bash
+#!/bin/bash
 set -e
 
 # 颜色定义
@@ -150,7 +31,7 @@ SKIPPED_PORTS=0
 MANUAL_PORTS=""
 
 # 修复：使用临时文件记录处理结果，解决子shell变量问题
-TEMP_RESULTS="/tmp/firewall_results_$"
+TEMP_RESULTS="/tmp/firewall_results_$$"
 OPENED_PORTS_LIST=()
 SKIPPED_PORTS_LIST=()
 
@@ -322,13 +203,12 @@ parse_arguments() {
 }
 
 show_help() {
-    cat << EOF
-${SCRIPT_NAME} v${SCRIPT_VERSION}
+    cat << 'EOF'
+代理服务器智能防火墙脚本 (nftables版) v6.1
 
 专为代理服务器设计的智能防火墙配置脚本，使用nftables提供更好的性能和端口范围支持。
 
 用法: bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/ufw/refs/heads/main/duankou.sh)
-      sudo $0 [选项]
 
 选项:
     --debug           启用调试模式，显示详细检测信息
@@ -348,29 +228,13 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
     ✓ SSH暴力破解防护 (连接速率限制)
     ✓ 支持所有主流代理软件和面板
 
-支持的代理软件:
-    - Xray, V2Ray, V2RayA
-    - Sing-box, Mihomo, Clash
-    - Hysteria, Hysteria2 (自动检测端口范围)
-    - TUIC, Trojan, Trojan-Go
-    - Shadowsocks (所有变体)
-    - Hiddify Panel
-    - WireGuard, OpenVPN
-    - 其他常见代理软件
-
 端口格式示例:
     --manual-ports "tcp:80,443,8080-8090;udp:53,16800-16900"
     --manual-ports "tcp:16800-16900;udp:36712-36720"
-
-示例:
-    bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/ufw/refs/heads/main/duankou.sh)
-    sudo ./firewall.sh --debug --dry-run
-    sudo ./firewall.sh --force
-    sudo ./firewall.sh --manual-ports "tcp:16800-16900;udp:36712-36720"
 EOF
 }
 
-# 新增：解析手动端口参数
+# 解析手动端口参数
 parse_manual_ports() {
     if [ -z "$MANUAL_PORTS" ]; then
         return
@@ -378,16 +242,16 @@ parse_manual_ports() {
     
     info "解析手动端口设置..."
     
-    # 分割 TCP 和 UDP 部分 (格式: "tcp:80,443,8080-8090;udp:53,16800-16900")
+    # 分割 TCP 和 UDP 部分
     IFS=';' read -ra PORT_SECTIONS <<< "$MANUAL_PORTS"
     
     for section in "${PORT_SECTIONS[@]}"; do
         if [[ "$section" =~ ^tcp:(.+)$ ]]; then
-            local tcp_ports="${BASH_REMATCH[1]}"
+            tcp_ports="${BASH_REMATCH[1]}"
             debug_log "TCP端口部分: $tcp_ports"
             parse_port_list "$tcp_ports" "tcp"
         elif [[ "$section" =~ ^udp:(.+)$ ]]; then
-            local udp_ports="${BASH_REMATCH[1]}"
+            udp_ports="${BASH_REMATCH[1]}"
             debug_log "UDP端口部分: $udp_ports"
             parse_port_list "$udp_ports" "udp"
         else
@@ -396,10 +260,10 @@ parse_manual_ports() {
     done
 }
 
-# 新增：解析端口列表（支持单个端口、范围、逗号分隔）
+# 解析端口列表（支持单个端口、范围、逗号分隔）
 parse_port_list() {
-    local port_list="$1"
-    local protocol="$2"
+    port_list="$1"
+    protocol="$2"
     
     IFS=',' read -ra PORTS <<< "$port_list"
     
@@ -434,7 +298,7 @@ parse_port_list() {
     done
 }
 
-# 新增：手动输入端口功能
+# 手动输入端口功能
 prompt_for_manual_ports() {
     if [ "$FORCE_MODE" = true ] || [ "$DRY_RUN" = true ]; then
         return
@@ -453,7 +317,7 @@ prompt_for_manual_ports() {
     fi
 }
 
-# 新增：智能检测 Hysteria2 端口跳跃需求
+# 智能检测 Hysteria2 端口跳跃需求
 detect_hysteria_port_ranges() {
     debug_log "检测 Hysteria2 端口跳跃配置..."
     
@@ -463,7 +327,6 @@ detect_hysteria_port_ranges() {
             if [ -f "$config_file" ]; then
                 # 检查 Hysteria2 端口跳跃配置
                 if command -v jq >/dev/null 2>&1; then
-                    local hop_ports
                     hop_ports=$(jq -r '.listen_ports? // .hop_ports? // empty' "$config_file" 2>/dev/null || true)
                     
                     if [ -n "$hop_ports" ] && [ "$hop_ports" != "null" ]; then
@@ -471,7 +334,7 @@ detect_hysteria_port_ranges() {
                         
                         # 解析端口跳跃范围 (如: "16800-16900")
                         if [[ "$hop_ports" =~ ^\"([0-9]+-[0-9]+)\"$ ]]; then
-                            local range="${BASH_REMATCH[1]}"
+                            range="${BASH_REMATCH[1]}"
                             PORT_RANGES_UDP+=("$range")
                             info "自动检测到 Hysteria2 UDP端口范围: $range"
                         fi
@@ -480,7 +343,6 @@ detect_hysteria_port_ranges() {
                 
                 # 基于文本的检测作为备用
                 if grep -q "hop_ports\|listen_ports" "$config_file" 2>/dev/null; then
-                    local range_match
                     range_match=$(grep -oE '"[0-9]+-[0-9]+"' "$config_file" 2>/dev/null | tr -d '"' | head -1)
                     if [ -n "$range_match" ]; then
                         PORT_RANGES_UDP+=("$range_match")
@@ -586,7 +448,7 @@ cleanup_existing_firewalls() {
 
 detect_ssh_port() {
     debug_log "检测SSH端口..."
-    local ssh_port
+    ssh_port=""
     
     # 通过监听进程检测 (优先级最高)
     ssh_port=$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1)
@@ -654,10 +516,10 @@ get_listening_ports() {
     }'
 }
 
-# 新增：从配置文件中提取端口
+# 从配置文件中提取端口
 extract_ports_from_configs() {
     debug_log "从配置文件提取端口信息..."
-    local found_ports=()
+    found_ports=()
     
     for config_path in "${CONFIG_PATHS[@]}"; do
         # 支持通配符路径
@@ -669,7 +531,6 @@ extract_ports_from_configs() {
                 if [[ "$config_file" == *.json ]]; then
                     if command -v jq >/dev/null 2>&1; then
                         # 使用jq提取端口
-                        local ports
                         ports=$(jq -r '
                             [
                                 .inbounds[]?.port?,
@@ -689,7 +550,6 @@ extract_ports_from_configs() {
                         done
                     else
                         # 简单文本匹配作为备用
-                        local ports
                         ports=$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+$' || true)
                         for port in $ports; do
                             if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
@@ -702,7 +562,6 @@ extract_ports_from_configs() {
                 
                 # YAML 配置文件 (基础支持)
                 if [[ "$config_file" == *.yaml ]] || [[ "$config_file" == *.yml ]]; then
-                    local ports
                     ports=$(grep -oE 'port[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+$' || true)
                     for port in $ports; do
                         if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
@@ -720,7 +579,7 @@ extract_ports_from_configs() {
 }
 
 is_public_listener() {
-    local address="$1"
+    address="$1"
     case "$address" in 
         "127.0.0.1"|"::1"|"localhost"|127.*) return 1 ;;
         *) return 0 ;;
@@ -728,12 +587,12 @@ is_public_listener() {
 }
 
 is_system_reserved_port() {
-    local port="$1"
+    port="$1"
     for reserved in "${SYSTEM_RESERVED_PORTS[@]}"; do
         if [[ "$reserved" == *"-"* ]]; then
             # 端口范围检查
-            local start="${reserved%-*}"
-            local end="${reserved#*-}"
+            start="${reserved%-*}"
+            end="${reserved#*-}"
             if [ "$port" -ge "$start" ] && [ "$port" -le "$end" ]; then
                 return 0
             fi
@@ -744,10 +603,10 @@ is_system_reserved_port() {
     return 1
 }
 
-# 改进：更宽松的代理进程检测
+# 更宽松的代理进程检测
 is_proxy_process() {
-    local process="$1"
-    local pid="$2"
+    process="$1"
+    pid="$2"
     
     debug_log "检查进程: $process (PID: $pid)"
     
@@ -777,7 +636,6 @@ is_proxy_process() {
     
     # 检查完整命令行
     if [ -n "$pid" ] && [ -f "/proc/$pid/cmdline" ]; then
-        local cmdline
         cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || echo "")
         debug_log "命令行: $cmdline"
         
@@ -797,7 +655,7 @@ is_proxy_process() {
         done
         
         # 检查常见代理相关关键词
-        local proxy_keywords=("proxy" "tunnel" "forward" "relay" "bridge" "vpn" "tls" "vmess" "vless" "trojan" "shadowsocks" "hysteria")
+        proxy_keywords=("proxy" "tunnel" "forward" "relay" "bridge" "vpn" "tls" "vmess" "vless" "trojan" "shadowsocks" "hysteria")
         for keyword in "${proxy_keywords[@]}"; do
             if [[ "$cmdline" == *"$keyword"* ]]; then
                 debug_log "命令行包含代理关键词: $keyword"
@@ -810,7 +668,7 @@ is_proxy_process() {
 }
 
 is_common_proxy_port() {
-    local port="$1"
+    port="$1"
     for common_port in "${COMMON_PROXY_PORTS[@]}"; do
         if [ "$port" = "$common_port" ]; then
             debug_log "端口 $port 在常见代理端口列表中"
@@ -821,7 +679,7 @@ is_common_proxy_port() {
 }
 
 is_dangerous_port() {
-    local port="$1"
+    port="$1"
     for dangerous in "${DANGEROUS_PORTS[@]}"; do
         if [ "$port" = "$dangerous" ]; then
             return 0
@@ -830,9 +688,14 @@ is_dangerous_port() {
     return 1
 }
 
-# 改进：更智能的端口分析策略
+# 更智能的端口分析策略
 analyze_port() {
-    local protocol=$1 port=$2 address=$3 process=$4 pid=$5 source=${6:-"listening"}
+    protocol=$1 
+    port=$2 
+    address=$3 
+    process=$4 
+    pid=$5 
+    source=${6:-"listening"}
     
     debug_log "分析端口: $protocol/$port, 地址: $address, 进程: $process, 来源: $source"
     
@@ -910,7 +773,7 @@ analyze_port() {
 }
 
 # ==============================================================================
-# nftables 防火墙配置 - 修复的版本
+# nftables 防火墙配置
 # ==============================================================================
 
 setup_nftables() {
@@ -924,11 +787,11 @@ setup_nftables() {
     success "nftables 基础规则已生成"
 }
 
-# 改进的端口规则添加函数
+# 端口规则添加函数
 add_port_rule() {
-    local port="$1"
-    local protocol="$2"
-    local comment="$3"
+    port="$1"
+    protocol="$2"
+    comment="$3"
     
     debug_log "添加端口规则: $protocol/$port - $comment"
     
@@ -937,7 +800,7 @@ add_port_rule() {
         return
     fi
     
-    # 根据端口类型分类存储，而不是直接写入文件
+    # 根据端口类型分类存储
     if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
         # 端口范围
         if [ "$protocol" = "tcp" ]; then
@@ -968,11 +831,11 @@ add_port_rule() {
     fi
 }
 
-# 新增：生成优化的 nftables 规则
+# 生成优化的 nftables 规则
 generate_optimized_rules() {
-    local rules=""
+    rules=""
     
-    # 1. 首先添加端口范围（优先级最高，避免被单个端口覆盖）
+    # 1. 首先添加端口范围
     if [ ${#PORT_RANGES_TCP[@]} -gt 0 ]; then
         rules+="\n        # TCP 端口范围\n"
         for range in "${PORT_RANGES_TCP[@]}"; do
@@ -990,13 +853,13 @@ generate_optimized_rules() {
     # 2. 然后添加单个端口（优化：合并为集合）
     if [ ${#SINGLE_PORTS_TCP[@]} -gt 0 ]; then
         # 去重并排序
-        local unique_tcp_ports=($(printf '%s\n' "${SINGLE_PORTS_TCP[@]}" | sort -nu))
+        unique_tcp_ports=($(printf '%s\n' "${SINGLE_PORTS_TCP[@]}" | sort -nu))
         if [ ${#unique_tcp_ports[@]} -eq 1 ]; then
             rules+="\n        # TCP 单个端口\n"
             rules+="        tcp dport ${unique_tcp_ports[0]} accept comment \"代理服务端口\"\n"
         else
             # 多个端口使用集合语法
-            local tcp_port_set=$(IFS=','; echo "${unique_tcp_ports[*]}")
+            tcp_port_set=$(IFS=','; echo "${unique_tcp_ports[*]}")
             rules+="\n        # TCP 端口集合\n"
             rules+="        tcp dport { $tcp_port_set } accept comment \"代理服务端口集合\"\n"
         fi
@@ -1004,13 +867,13 @@ generate_optimized_rules() {
     
     if [ ${#SINGLE_PORTS_UDP[@]} -gt 0 ]; then
         # 去重并排序
-        local unique_udp_ports=($(printf '%s\n' "${SINGLE_PORTS_UDP[@]}" | sort -nu))
+        unique_udp_ports=($(printf '%s\n' "${SINGLE_PORTS_UDP[@]}" | sort -nu))
         if [ ${#unique_udp_ports[@]} -eq 1 ]; then
             rules+="\n        # UDP 单个端口\n"
             rules+="        udp dport ${unique_udp_ports[0]} accept comment \"代理服务端口\"\n"
         else
             # 多个端口使用集合语法
-            local udp_port_set=$(IFS=','; echo "${unique_udp_ports[*]}")
+            udp_port_set=$(IFS=','; echo "${unique_udp_ports[*]}")
             rules+="\n        # UDP 端口集合\n"
             rules+="        udp dport { $udp_port_set } accept comment \"代理服务端口集合\"\n"
         fi
@@ -1023,24 +886,19 @@ generate_optimized_rules() {
     
     echo -e "$rules"
 }
+
+apply_nftables_rules() {
+    info "应用 nftables 防火墙规则..."
+    
     if [ "$DRY_RUN" = true ]; then 
         info "[预演] 将应用所有 nftables 规则并启用服务"
         return
     fi
     
-    # 读取代理规则
-    local proxy_rules=""
-    if [ -f /tmp/proxy_rules.tmp ]; then
-        proxy_rules=$(cat /tmp/proxy_rules.tmp)
-        rm -f /tmp/proxy_rules.tmp
-    fi
+    # 生成优化的代理规则
+    proxy_rules=$(generate_optimized_rules)
     
-    # 如果没有任何代理规则，添加一个注释
-    if [ -z "$proxy_rules" ]; then
-        proxy_rules="        # 没有检测到需要开放的代理端口"
-    fi
-    
-    # 直接创建完整的 nftables 配置文件，避免使用 sed 替换
+    # 创建完整的 nftables 配置文件
     cat > /etc/nftables.conf << EOF
 #!/usr/sbin/nft -f
 
@@ -1084,7 +942,7 @@ $proxy_rules
         drop
     }
     
-    # 转发链 (如果需要NAT转发可以修改)
+    # 转发链
     chain forward {
         type filter hook forward priority filter; policy drop;
     }
@@ -1126,33 +984,27 @@ EOF
     else
         warning "防火墙规则可能未正确加载"
     fi
-    
-    # 清理临时文件
-    rm -f /tmp/nftables.conf
 }
 
 # ==============================================================================
-# 主要处理流程 - 修复子shell问题
+# 主要处理流程
 # ==============================================================================
 
 process_ports() {
     info "开始分析监听端口和配置文件..."
     
     # 初始化临时文件
-    > /tmp/proxy_rules.tmp
     > "$TEMP_RESULTS"
     
     # 1. 获取监听端口
-    local listening_data
     listening_data=$(get_listening_ports)
     
     # 2. 获取配置文件端口
-    local config_data
     config_data=$(extract_ports_from_configs)
     
     # 统计信息
-    local listening_count=0
-    local config_count=0
+    listening_count=0
+    config_count=0
     
     if [ -n "$listening_data" ]; then
         listening_count=$(echo "$listening_data" | wc -l)
@@ -1169,10 +1021,9 @@ process_ports() {
         echo "$listening_data" | while IFS=: read -r protocol port address process pid; do
             [ -z "$port" ] && continue
             
-            local result
             result=$(analyze_port "$protocol" "$port" "$address" "$process" "$pid" "listening")
-            local action="${result%%:*}"
-            local reason="${result#*:}"
+            action="${result%%:*}"
+            reason="${result#*:}"
             
             # 写入结果到临时文件
             echo "$action:$port:$protocol:$reason:$process" >> "$TEMP_RESULTS"
@@ -1198,10 +1049,9 @@ process_ports() {
                 continue
             fi
             
-            local result
             result=$(analyze_port "tcp" "$port" "config" "config-file" "" "config")
-            local action="${result%%:*}"
-            local reason="${result#*:}"
+            action="${result%%:*}"
+            reason="${result#*:}"
             
             # 写入结果到临时文件
             echo "$action:$port:tcp:$reason:config($(basename "$config_file"))" >> "$TEMP_RESULTS"
@@ -1217,7 +1067,7 @@ process_ports() {
         done
     fi
     
-    # 从结果文件统计数据 (解决子shell变量问题)
+    # 从结果文件统计数据
     if [ -f "$TEMP_RESULTS" ]; then
         while IFS=: read -r action port protocol reason process; do
             [ -z "$action" ] && continue
@@ -1229,6 +1079,28 @@ process_ports() {
                 SKIPPED_PORTS_LIST+=("$port/$protocol ($reason)")
             fi
         done < "$TEMP_RESULTS"
+    fi
+    
+    # 统计手动添加的端口
+    manual_count=0
+    manual_count=$((${#PORT_RANGES_TCP[@]} + ${#PORT_RANGES_UDP[@]} + ${#SINGLE_PORTS_TCP[@]} + ${#SINGLE_PORTS_UDP[@]}))
+    
+    if [ $manual_count -gt 0 ]; then
+        OPENED_PORTS=$((OPENED_PORTS + manual_count))
+        
+        # 添加手动端口到显示列表
+        for range in "${PORT_RANGES_TCP[@]}"; do
+            OPENED_PORTS_LIST+=("$range/tcp (手动范围)")
+        done
+        for range in "${PORT_RANGES_UDP[@]}"; do
+            OPENED_PORTS_LIST+=("$range/udp (手动范围)")
+        done
+        for port in "${SINGLE_PORTS_TCP[@]}"; do
+            OPENED_PORTS_LIST+=("$port/tcp (手动端口)")
+        done
+        for port in "${SINGLE_PORTS_UDP[@]}"; do
+            OPENED_PORTS_LIST+=("$port/udp (手动端口)")
+        done
     fi
     
     info "端口处理完成: 开放 $OPENED_PORTS 个, 跳过 $SKIPPED_PORTS 个"
@@ -1261,23 +1133,6 @@ show_final_status() {
         echo -e "  - 进程名不在预定义列表中"
         echo -e "  - 配置文件位置不在检测路径中"
         echo -e "  - 用户选择不开放某些端口"
-        
-        echo -e "\n${CYAN}💡 建议操作：${RESET}"
-        echo -e "  1. 使用强制模式: ${YELLOW}curl -sSL <script_url> | bash -s -- --force${RESET}"
-        echo -e "  2. 启动代理服务后重新运行脚本"
-        echo -e "  3. 检查代理配置文件路径是否正确"
-        echo -e "  4. 手动添加端口 (见下方命令)"
-    fi
-    
-    # 显示跳过端口的统计 (简化显示)
-    if [ ${#SKIPPED_PORTS_LIST[@]} -gt 0 ]; then
-        local skip_count=${#SKIPPED_PORTS_LIST[@]}
-        echo -e "\n${BLUE}ℹ️ 跳过了 $skip_count 个端口 (系统保留、内网监听等)${RESET}"
-        if [ "$DEBUG_MODE" = true ]; then
-            for port_info in "${SKIPPED_PORTS_LIST[@]}"; do
-                echo -e "  ${BLUE}• $port_info${RESET}"
-            done
-        fi
     fi
     
     if [ "$DRY_RUN" = true ]; then
@@ -1288,15 +1143,12 @@ show_final_status() {
     
     echo -e "\n${YELLOW}🔥 当前防火墙规则：${RESET}"
     if command -v nft >/dev/null 2>&1; then
-        local rule_count=0
-        local accept_rules
         accept_rules=$(nft list ruleset 2>/dev/null | grep -E "dport.*accept" || echo "")
         
         if [ -n "$accept_rules" ]; then
             echo "$accept_rules" | while IFS= read -r line; do
                 if [[ "$line" == *"dport"* && "$line" == *"accept"* ]]; then
                     echo -e "  ${CYAN}$line${RESET}"
-                    rule_count=$((rule_count + 1))
                 fi
             done
         fi
@@ -1308,59 +1160,14 @@ show_final_status() {
         echo -e "  ${RED}❌ nftables 未正确安装或配置${RESET}"
     fi
     
-    echo -e "\n${YELLOW}🛡️ 安全特性：${RESET}"
-    echo -e "  - ${GREEN}✓ 使用 nftables 高性能防火墙${RESET}"
-    echo -e "  - ${GREEN}✓ SSH端口($SSH_PORT) 暴力破解保护 (5次/分钟)${RESET}"
-    echo -e "  - ${GREEN}✓ 自动过滤系统保留端口${RESET}"
-    echo -e "  - ${GREEN}✓ 支持端口范围和端口跳跃${RESET}"
-    echo -e "  - ${GREEN}✓ 连接状态跟踪 (stateful firewall)${RESET}"
-    echo -e "  - ${GREEN}✓ ICMP 限速保护${RESET}"
-    echo -e "  - ${GREEN}✓ 日志记录可疑连接${RESET}"
-    
     echo -e "\n${CYAN}🔧 常用管理命令：${RESET}"
     echo -e "  ${YELLOW}查看所有规则:${RESET} sudo nft list ruleset"
     echo -e "  ${YELLOW}查看开放端口:${RESET} sudo nft list ruleset | grep dport"
-    echo -e "  ${YELLOW}查看SSH保护:${RESET} sudo nft list set inet filter ssh_bruteforce"
     echo -e "  ${YELLOW}重启防火墙:${RESET} sudo systemctl restart nftables"
-    echo -e "  ${YELLOW}查看防火墙状态:${RESET} sudo systemctl status nftables"
-    echo -e "  ${YELLOW}临时关闭防火墙:${RESET} sudo systemctl stop nftables"
     echo -e "  ${YELLOW}查看监听端口:${RESET} sudo ss -tulnp"
     
-    echo -e "\n${CYAN}➕ 手动管理端口：${RESET}"
-    echo -e "  ${YELLOW}添加TCP端口:${RESET} sudo nft add rule inet filter input tcp dport [端口] accept"
-    echo -e "  ${YELLOW}添加UDP端口:${RESET} sudo nft add rule inet filter input udp dport [端口] accept"
-    echo -e "  ${YELLOW}添加端口范围:${RESET} sudo nft add rule inet filter input tcp dport 8080-8090 accept"
-    echo -e "  ${YELLOW}添加端口集合:${RESET} sudo nft add rule inet filter input tcp dport { 80, 443, 8080 } accept"
-    echo -e "  ${YELLOW}删除规则:${RESET} sudo nft -a list ruleset (查看句柄), sudo nft delete rule inet filter input handle [句柄]"
-    echo -e "  ${YELLOW}重新运行脚本添加端口:${RESET} sudo ./firewall.sh --manual-ports \"tcp:16800-16900;udp:36712-36720\""
-    
-    # 高级故障排除
-    if [ ${#OPENED_PORTS_LIST[@]} -eq 0 ]; then
-        echo -e "\n${YELLOW}🔍 高级故障排除：${RESET}"
-        echo -e "  ${CYAN}1. 检查代理服务状态:${RESET}"
-        echo -e "     sudo systemctl status xray v2ray sing-box hysteria2"
-        echo -e "  ${CYAN}2. 查看所有监听端口:${RESET}"
-        echo -e "     sudo ss -tulnp | grep LISTEN"
-        echo -e "  ${CYAN}3. 查找代理进程:${RESET}"
-        echo -e "     ps aux | grep -E 'xray|v2ray|sing-box|hysteria|trojan'"
-        echo -e "  ${CYAN}4. 检查配置文件:${RESET}"
-        echo -e "     find /etc /opt /usr/local -name '*.json' -o -name '*.yaml' | grep -E 'xray|v2ray|sing-box'"
-        echo -e "  ${CYAN}5. 强制模式重新运行:${RESET}"
-        echo -e "     bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/ufw/refs/heads/main/duankou.sh) --force"
-        echo -e "  ${CYAN}6. 手动指定 Hysteria2 端口范围:${RESET}"
-        echo -e "     sudo ./firewall.sh --manual-ports \"udp:16800-16900\""
-    fi
-    
-    # 显示优化建议
-    if [ ${#PORT_RANGES_TCP[@]} -gt 0 ] || [ ${#PORT_RANGES_UDP[@]} -gt 0 ]; then
-        echo -e "\n${GREEN}🎯 端口范围优化成功！${RESET}"
-        echo -e "  - 端口范围规则优先级已调整到最高"
-        echo -e "  - 避免了单个端口规则的覆盖问题"
-        echo -e "  - 支持 Hysteria2 端口跳跃等高级功能"
-    fi
-    
     # 清理临时文件
-    rm -f "$TEMP_RESULTS" /tmp/proxy_rules.tmp 2>/dev/null || true
+    rm -f "$TEMP_RESULTS" 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -1369,7 +1176,7 @@ show_final_status() {
 
 main() {
     # 设置陷阱处理中断
-    trap 'echo -e "\n${RED}❌ 操作被中断，正在清理...${RESET}"; rm -f "$TEMP_RESULTS" /tmp/proxy_rules.tmp /tmp/nftables.conf 2>/dev/null || true; exit 130' INT TERM
+    trap 'echo -e "\n${RED}❌ 操作被中断，正在清理...${RESET}"; rm -f "$TEMP_RESULTS" 2>/dev/null || true; exit 130' INT TERM
     
     # 解析命令行参数
     parse_arguments "$@"
@@ -1404,22 +1211,6 @@ main() {
     show_final_status
     
     echo -e "\n${GREEN}🎯 脚本执行完毕！代理服务器防火墙配置成功！${RESET}"
-    
-    # 最终提醒
-    if [ "$FORCE_MODE" = false ] && [ ${#OPENED_PORTS_LIST[@]} -eq 0 ]; then
-        echo -e "\n${YELLOW}💡 提示: 如果你确定要开放所有检测到的代理端口，可以使用:${RESET}"
-        echo -e "${CYAN}bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/ufw/refs/heads/main/duankou.sh) --force${RESET}"
-        echo -e "\n${YELLOW}或者为 Hysteria2 手动指定端口范围:${RESET}"
-        echo -e "${CYAN}sudo ./firewall.sh --manual-ports \"udp:16800-16900\"${RESET}"
-    fi
-    
-    # 特别提醒 Hysteria2 用户
-    if [ ${#PORT_RANGES_UDP[@]} -eq 0 ] && (ps aux | grep -q hysteria 2>/dev/null); then
-        echo -e "\n${YELLOW}🔔 Hysteria2 用户注意:${RESET}"
-        echo -e "  检测到 Hysteria2 进程，但未找到 UDP 端口范围配置"
-        echo -e "  如果使用端口跳跃功能，请手动添加端口范围："
-        echo -e "  ${CYAN}sudo ./firewall.sh --manual-ports \"udp:16800-16900\"${RESET}"
-    fi
 }
 
 # 脚本入口点
