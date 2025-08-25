@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="6.0"
+SCRIPT_VERSION="6.1"
 SCRIPT_NAME="代理服务器智能防火墙脚本 (nftables版)"
 
 echo -e "${YELLOW}== 🔥 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
@@ -657,7 +657,7 @@ analyze_port() {
 }
 
 # ==============================================================================
-# nftables 防火墙配置
+# nftables 防火墙配置 - 修复的版本
 # ==============================================================================
 
 setup_nftables() {
@@ -668,8 +668,56 @@ setup_nftables() {
         return
     fi
     
-    # 创建基础规则集
-    cat > /tmp/nftables.conf << EOF
+    success "nftables 基础规则已生成"
+}
+
+add_port_rule() {
+    local port="$1"
+    local protocol="$2"
+    local comment="$3"
+    
+    debug_log "添加端口规则: $protocol/$port - $comment"
+    
+    if [ "$DRY_RUN" = true ]; then 
+        info "[预演] 将添加规则: $protocol dport $port accept # $comment"
+        return
+    fi
+    
+    # 处理端口范围
+    if [[ "$port" == *"-"* ]]; then
+        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
+    # 处理单个端口
+    elif [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
+    # 处理端口列表 (如: 8080,8443,9090)
+    elif [[ "$port" == *","* ]]; then
+        echo "        $protocol dport { $port } accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
+    else
+        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
+    fi
+}
+
+# 修复的 apply_nftables_rules 函数
+apply_nftables_rules() {
+    if [ "$DRY_RUN" = true ]; then 
+        info "[预演] 将应用所有 nftables 规则并启用服务"
+        return
+    fi
+    
+    # 读取代理规则
+    local proxy_rules=""
+    if [ -f /tmp/proxy_rules.tmp ]; then
+        proxy_rules=$(cat /tmp/proxy_rules.tmp)
+        rm -f /tmp/proxy_rules.tmp
+    fi
+    
+    # 如果没有任何代理规则，添加一个注释
+    if [ -z "$proxy_rules" ]; then
+        proxy_rules="        # 没有检测到需要开放的代理端口"
+    fi
+    
+    # 直接创建完整的 nftables 配置文件，避免使用 sed 替换
+    cat > /etc/nftables.conf << EOF
 #!/usr/sbin/nft -f
 
 # 清空现有规则
@@ -704,8 +752,8 @@ table inet filter {
             drop comment "SSH暴力破解保护"
         tcp dport $SSH_PORT accept comment "SSH访问"
         
-        # 代理端口规则将在这里添加
-        %PROXY_RULES%
+        # 代理端口规则
+$proxy_rules
         
         # 记录并丢弃其他包 (限制日志频率)
         limit rate 5/minute log prefix "nft-drop: "
@@ -723,56 +771,6 @@ table inet filter {
     }
 }
 EOF
-    
-    success "nftables 基础规则已生成"
-}
-
-add_port_rule() {
-    local port="$1"
-    local protocol="$2"
-    local comment="$3"
-    
-    debug_log "添加端口规则: $protocol/$port - $comment"
-    
-    if [ "$DRY_RUN" = true ]; then 
-        info "[预演] 将添加规则: $protocol dport $port accept # $comment"
-        return
-    fi
-    
-    # 处理端口范围
-    if [[ "$port" == *"-"* ]]; then
-        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
-    # 处理单个端口
-    elif [[ "$port" =~ ^[0-9]+$ ]]; then
-        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
-    # 处理端口列表 (如: 8080,8443,9090)
-    elif [[ "$port" == *","* ]]; then
-        echo "        $protocol dport { $port } accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
-    else
-        echo "        $protocol dport $port accept comment \"$comment\"" >> /tmp/proxy_rules.tmp
-    fi
-}
-
-apply_nftables_rules() {
-    if [ "$DRY_RUN" = true ]; then 
-        info "[预演] 将应用所有 nftables 规则并启用服务"
-        return
-    fi
-    
-    # 读取代理规则
-    local proxy_rules=""
-    if [ -f /tmp/proxy_rules.tmp ]; then
-        proxy_rules=$(cat /tmp/proxy_rules.tmp)
-        rm -f /tmp/proxy_rules.tmp
-    fi
-    
-    # 如果没有任何代理规则，添加一个注释
-    if [ -z "$proxy_rules" ]; then
-        proxy_rules="        # 没有检测到需要开放的代理端口"
-    fi
-    
-    # 替换规则占位符
-    sed "s|%PROXY_RULES%|$proxy_rules|g" /tmp/nftables.conf > /etc/nftables.conf
     
     # 设置正确的权限
     chmod 755 /etc/nftables.conf
