@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="5.0"
+SCRIPT_VERSION="5.1"
 SCRIPT_NAME="代理服务器智能防火墙脚本 (nftables版)"
 
 echo -e "${YELLOW}== 🔥 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
@@ -28,6 +28,10 @@ DRY_RUN=false
 SSH_PORT=""
 OPENED_PORTS=0
 SKIPPED_PORTS=0
+
+# 端口记录数组
+declare -a OPENED_PORTS_LIST=()
+declare -a SKIPPED_PORTS_LIST=()
 
 # ==============================================================================
 # 核心配置数据库
@@ -571,6 +575,10 @@ process_ports() {
     total_ports=$(echo "$port_data" | wc -l)
     info "检测到 $total_ports 个监听端口"
     
+    # 修复：使用临时文件避免子shell问题
+    local temp_file="/tmp/port_analysis_results"
+    > "$temp_file"
+    
     echo "$port_data" | while IFS=: read -r protocol port address process pid; do
         [ -z "$port" ] && continue
         
@@ -579,15 +587,30 @@ process_ports() {
         local action="${result%%:*}"
         local reason="${result#*:}"
         
+        # 记录处理结果到临时文件
+        echo "$action:$port:$protocol:$reason:$process" >> "$temp_file"
+        
         if [ "$action" = "open" ]; then
             echo -e "  ${GREEN}✓ 开放: ${CYAN}$port/$protocol${GREEN} - $reason${RESET}"
             add_port_rule "$port" "$protocol" "$reason"
-            OPENED_PORTS=$((OPENED_PORTS + 1))
         else
             echo -e "  ${BLUE}⏭️ 跳过: ${CYAN}$port/$protocol${BLUE} - $reason${RESET}"
-            SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
         fi
     done
+    
+    # 从临时文件读取统计信息
+    if [ -f "$temp_file" ]; then
+        while IFS=: read -r action port protocol reason process; do
+            if [ "$action" = "open" ]; then
+                OPENED_PORTS=$((OPENED_PORTS + 1))
+                OPENED_PORTS_LIST+=("$port/$protocol ($process)")
+            else
+                SKIPPED_PORTS=$((SKIPPED_PORTS + 1))
+                SKIPPED_PORTS_LIST+=("$port/$protocol ($reason)")
+            fi
+        done < "$temp_file"
+        rm -f "$temp_file"
+    fi
 }
 
 show_final_status() {
@@ -600,26 +623,72 @@ show_final_status() {
     echo -e "  - ${BLUE}跳过端口: $SKIPPED_PORTS${RESET}"
     echo -e "  - ${CYAN}SSH端口: $SSH_PORT (已启用暴力破解保护)${RESET}"
     
+    # 显示详细的开放端口列表
+    if [ ${#OPENED_PORTS_LIST[@]} -gt 0 ]; then
+        echo -e "\n${GREEN}✅ 已开放的端口：${RESET}"
+        for port_info in "${OPENED_PORTS_LIST[@]}"; do
+            echo -e "  ${GREEN}• $port_info${RESET}"
+        done
+    else
+        echo -e "\n${YELLOW}⚠️ 没有代理端口被自动开放！${RESET}"
+        echo -e "  ${YELLOW}可能原因：${RESET}"
+        echo -e "    - 代理服务未运行或监听在内网地址"
+        echo -e "    - 进程名不在预定义列表中"
+        echo -e "    - 用户选择不开放"
+    fi
+    
+    # 显示跳过端口的原因
+    if [ ${#SKIPPED_PORTS_LIST[@]} -gt 0 ]; then
+        echo -e "\n${BLUE}ℹ️ 跳过的端口：${RESET}"
+        for port_info in "${SKIPPED_PORTS_LIST[@]}"; do
+            echo -e "  ${BLUE}• $port_info${RESET}"
+        done
+    fi
+    
     if [ "$DRY_RUN" = true ]; then
-        echo -e "\n${CYAN}>>> 预演模式结束 <<<${RESET}"
+        echo -e "\n${CYAN}>>> 预演模式结束，没有实际修改防火墙 <<<${RESET}"
         return
     fi
     
     echo -e "\n${YELLOW}当前防火墙规则：${RESET}"
-    nft list ruleset | grep -E "(dport|comment)" | while read -r line; do
-        echo -e "  ${CYAN}$line${RESET}"
-    done
+    if command -v nft >/dev/null 2>&1; then
+        # 显示所有允许的端口规则
+        local rule_count=0
+        while IFS= read -r line; do
+            if [[ "$line" == *"dport"* && "$line" == *"accept"* ]]; then
+                echo -e "  ${CYAN}$line${RESET}"
+                rule_count=$((rule_count + 1))
+            fi
+        done < <(nft list ruleset 2>/dev/null)
+        
+        if [ "$rule_count" -eq 0 ]; then
+            echo -e "  ${YELLOW}没有检测到开放端口的规则${RESET}"
+        fi
+    else
+        echo -e "  ${RED}nftables 未正确安装或配置${RESET}"
+    fi
     
     echo -e "\n${YELLOW}安全提醒：${RESET}"
     echo -e "  - 使用 nftables 高性能防火墙"
-    echo -e "  - SSH端口已启用暴力破解保护"
+    echo -e "  - SSH端口($SSH_PORT)已启用暴力破解保护"
     echo -e "  - 自动过滤系统保留端口"
     echo -e "  - 支持端口范围和端口跳跃"
     
     echo -e "\n${CYAN}常用命令：${RESET}"
     echo -e "  - 查看规则: ${YELLOW}sudo nft list ruleset${RESET}"
+    echo -e "  - 查看开放端口: ${YELLOW}sudo nft list ruleset | grep dport${RESET}"
     echo -e "  - 重启防火墙: ${YELLOW}sudo systemctl restart nftables${RESET}"
     echo -e "  - 禁用防火墙: ${YELLOW}sudo systemctl stop nftables${RESET}"
+    echo -e "  - 手动添加端口: ${YELLOW}sudo nft add rule inet filter input tcp dport [端口] accept${RESET}"
+    
+    # 如果没有代理端口被开放，给出建议
+    if [ ${#OPENED_PORTS_LIST[@]} -eq 0 ]; then
+        echo -e "\n${YELLOW}🔧 故障排除建议：${RESET}"
+        echo -e "  1. 确认代理服务正在运行: ${CYAN}sudo systemctl status xray v2ray sing-box${RESET}"
+        echo -e "  2. 检查代理服务监听地址: ${CYAN}sudo ss -tlnp | grep -E 'xray|v2ray|sing-box|hysteria'${RESET}"
+        echo -e "  3. 使用强制模式重新运行: ${CYAN}sudo $0 --force${RESET}"
+        echo -e "  4. 手动添加端口规则 (例如8080端口): ${CYAN}sudo nft add rule inet filter input tcp dport 8080 accept${RESET}"
+    fi
 }
 
 # ==============================================================================
